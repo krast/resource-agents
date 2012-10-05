@@ -1,0 +1,387 @@
+#!/bin/sh
+#
+#
+# glbd 
+#
+# Description:  Manages a Galera Load Balancer daemon (glbd) instance
+#
+# Authors:      Martin Gerhard Loschwitz
+#
+# Support:      linux-ha@lists.linux-ha.org
+# License:      GNU General Public License (GPL)
+#
+# (c) 2012      hastexo Professional Services GmbH
+#
+# This resource agent is losely derived from the MySQL resource
+# agent, which itself is made available to the public under the
+# following copyright:
+# 
+# (c) 2002-2005 International Business Machines, Inc.
+#     2005-2010 Linux-HA contributors
+#
+# See usage() function below for more details ...
+#
+# OCF instance parameters:
+#   OCF_RESKEY_binary
+#   OCF_RESKEY_threads
+#   OCF_RESKEY_control_address
+#   OCF_RESKEY_destination_servers
+#   OCF_RESKEY_listen_address
+#   OCF_RESKEY_additional_parameters
+#   OCF_RESKEY_control_socket
+#   OCF_RESKEY_pid
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+
+# Fill in some defaults if no values are specified
+OCF_RESKEY_binary_default="glbd"
+OCF_RESKEY_threads_default="6"
+OCF_RESKEY_control_address_default="127.0.0.1:4444"
+OCF_RESKEY_listen_address_default="127.0.0.1:3306"
+OCF_RESKEY_control_socket_default="/var/run/glbd/glbd.fifo"
+OCF_RESKEY_pid_default="$HA_RSCTMP/$OCF_RESOURCE_INSTANCE.pid"
+
+: ${OCF_RESKEY_binary=${OCF_RESKEY_binary_default}}
+: ${OCF_RESKEY_threads=${OCF_RESKEY_threads_default}}
+: ${OCF_RESKEY_control_address=${OCF_RESKEY_control_address_default}}
+: ${OCF_RESKEY_listen_address=${OCF_RESKEY_listen_address_default}}
+: ${OCF_RESKEY_control_socket=${OCF_RESKEY_control_socket_default}}
+: ${OCF_RESKEY_pid=${OCF_RESKEY_pid_default}}
+
+#######################################################################
+
+usage() {
+    cat <<UEND
+        usage: $0 (start|stop|validate-all|meta-data|status|monitor)
+
+        $0 manages a Galera Load Balancer daemon (glbd) instance 
+
+        The 'start' operation starts the identity service.
+        The 'stop' operation stops the identity service.
+        The 'validate-all' operation reports whether the parameters are valid
+        The 'meta-data' operation reports this RA's meta-data information
+        The 'status' operation reports whether the identity service is running
+        The 'monitor' operation reports whether the identity service seems to be working
+
+UEND
+}
+
+meta_data() {
+    cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="glbd">
+<version>1.0</version>
+
+<longdesc lang="en">
+Resource agent for the Galera Load Balancer daemon (glbd)
+May manage an instance or a clone set of the Galera Load
+Balancer daemon, which allows to load-balance a Galera
+replicated MySQL cluster.
+</longdesc>
+<shortdesc lang="en">Manages the Galera Load Balancer daemon (glbd)</shortdesc>
+<parameters>
+
+<parameter name="binary" unique="0" required="0">
+<longdesc lang="en">
+Location of the Galera Load Balancer daemor (glbd) binary
+</longdesc>
+<shortdesc lang="en">path to glbd</shortdesc>
+<content type="string" default="${OCF_RESKEY_binary_default}" />
+</parameter>
+
+<parameter name="threads" unique="0" required="0">
+<longdesc lang="en">
+Number of threads that glbd is allowed to use. The higher
+the number, the better is glbd's performance.
+</longdesc>
+<shortdesc lang="en">allowed number of glbd threads</shortdesc>
+<content type="string" default="${OCF_RESKEY_threads_default}" />
+</parameter>
+
+<parameter name="control_address" unique="0" required="0">
+<longdesc lang="en">
+The address and port of glbd's control interface required to 
+query the load balancer's status.
+The address entered here must follow the &lt;IP address&gt;:&lt;port&gt; 
+scheme.
+</longdesc>
+<shortdesc lang="en">glbd control interface address and port</shortdesc>
+<content type="string" default="${OCF_RESKEY_control_address_default}" />
+</parameter>
+
+<parameter name="destination_servers" unique="0" required="1">
+<longdesc lang="en">
+The servers that glbd may forward connections to, i.e. the
+actual application servers. 
+The list entered here must not be comma separated and contain 
+entries following the &lt;IP address&gt;:&lt;port&gt;:&lt;weight&gt; 
+scheme.
+</longdesc>
+<shortdesc lang="en">balancing destination servers</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="listen_address" unique="0" required="0">
+<longdesc lang="en">
+The address and port that glbd will listen on for incoming
+connections. The address entered here must follow the
+&lt;IP address&gt;:&lt;port&gt; scheme.
+</longdesc>
+<shortdesc lang="en">address and port to listen on</shortdesc>
+<content type="string" default="${OCF_RESKEY_listen_address_default}" />
+</parameter>
+
+<parameter name="pid" unique="0" required="0">
+<longdesc lang="en">
+The pid file to use for this glbd instance 
+</longdesc>
+<shortdesc lang="en">glbd pid file</shortdesc>
+<content type="string" default="${OCF_RESKEY_pid_default}" />
+</parameter>
+
+<parameter name="additional_parameters" unique="0" required="0">
+<longdesc lang="en">
+Additional parameters to pass on to glbd. See 'glbd --help' for
+a list of possible options.
+</longdesc>
+<shortdesc lang="en">Additional parameters for glbd</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="control_socket" unique="0" required="0">
+<longdesc lang="en">
+The file where glbd will store its FIFO socket.
+May be used to send control commands to glbd.
+</longdesc>
+<shortdesc lang="en">glbd control socket file</shortdesc>
+<content type="string" default="${OCF_RESKEY_control_socket_default}" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start" timeout="20" />
+<action name="stop" timeout="20" />
+<action name="status" timeout="20" />
+<action name="monitor" timeout="30" interval="20" />
+<action name="validate-all" timeout="5" />
+<action name="meta-data" timeout="5" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+# Functions invoked by resource manager actions
+
+glbd_validate() {
+    local rc
+
+    check_binary $OCF_RESKEY_binary
+    check_binary nc
+    check_binary pgrep
+    check_binary dirname
+
+    getent passwd daemon >/dev/null 2>&1
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        ocf_log err "User daemon doesn't exist"
+        return $OCF_ERR_INSTALLED
+    fi
+
+    true
+}
+
+glbd_status() {
+    local pid
+    local rc
+
+    if [ ! -f $OCF_RESKEY_pid ]; then
+      ocf_log info "Galera Load Balancer daemon (glbd) is not running"
+      return $OCF_NOT_RUNNING
+    else
+      pid=`cat $OCF_RESKEY_pid`
+    fi
+
+    if [ ! $pid ]; then
+      ocf_log info "Old PID file found, but empty"
+      return $OCF_NOT_RUNNING
+    fi
+
+    ocf_run -warn kill -s 0 $pid
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        return $OCF_SUCCESS
+    else
+        ocf_log info "Old PID file found, but Galera Load Balancer daemon (glbd) is not running"
+        return $OCF_NOT_RUNNING
+    fi
+}
+
+glbd_monitor() {
+    local rc
+
+    glbd_status
+    rc=$?
+
+    # If status returned anything but success, return that immediately
+    if [ $rc -ne $OCF_SUCCESS ]; then
+        return $rc
+    fi
+
+    # Check whether glbd is actually running and returning something meaningful
+    # in its control interface
+    address=`echo $OCF_RESKEY_control_address | cut -f1 -d':'`
+    port=`echo $OCF_RESKEY_control_address | cut -f2 -d':'`
+    status=`echo getinfo | nc -q 1 $address $port`
+    rc=$?
+       
+    if [ $rc -ne 0 ]; then
+      ocf_log err "Failed to connect to the Galera Load Balancer daemon (glbd): $rc"
+      return $OCF_NOT_RUNNING
+    else
+      destinations=`echo $status | grep -o 'Destinations: .*[0-9]'`
+    fi
+
+    ocf_log debug "Galera Load Balancer daemon (glbd) monitor succeeded ($destinations)"
+    return $OCF_SUCCESS
+}
+
+glbd_start() {
+    local rc
+
+    glbd_status
+    rc=$?
+    if [ $rc -eq $OCF_SUCCESS ]; then
+        ocf_log info "Galera Load Balancer daemon (glbd) already running"
+        return $OCF_SUCCESS
+    fi
+
+    # Make sure that the directory for our FIFO socket exists
+    directory=`dirname $OCF_RESKEY_control_socket`
+    if [ ! -e $directory ]; then
+      ocf_log info "glbd control socket directory not found; creating"
+      ocf_run mkdir -p $directory
+      ocf_run chown -R daemon:root $directory
+      ocf_run chmod -R 775 $directory
+    else
+      ocf_run chown -R daemon:root $directory
+      ocf_run chmod -R 775 $directory
+    fi
+
+    # make sure there is no old FIFO file lying around. glbd won't start otherwise.
+    if [ -e $OCF_RESKEY_control_socket ]; then
+      ocf_log info "Galera Load Balancer daemon not running, but old control socket found. deleting."
+      rm -f $OCF_RESKEY_control_socket
+    fi
+
+    # run the actual glbd daemon. 
+    ocf_run -q ${OCF_RESKEY_binary} --control ${OCF_RESKEY_control_address} --daemon --fifo \
+      ${OCF_RESKEY_control_socket} --threads ${OCF_RESKEY_threads} \
+      ${OCF_RESKEY_additional_parameters} ${OCF_RESKEY_listen_address} ${OCF_RESKEY_destination_servers}
+
+    # write down the daemon's PID. This is an ugly hack necessary for two reasons:
+    # 1. glbd doesn't offer a command line option to create a PID file on its own and
+    # 2. glbd forks twice after start, which renders the usual '& echo $!' trick
+    #    unusable unfortunately.
+    pid=`pgrep -f "${OCF_RESKEY_binary} --control ${OCF_RESKEY_control_address} (.*)"`
+    echo $pid > $OCF_RESKEY_pid 
+
+    # Spin waiting for the server to come up.
+    # Let the CRM/LRM time us out if required
+    while true; do
+    glbd_monitor
+    rc=$?
+    [ $rc -eq $OCF_SUCCESS ] && break
+    if [ $rc -ne $OCF_NOT_RUNNING ]; then
+        ocf_log err "Galera Load Balancer daemon (glbd) start failed"
+        exit $OCF_ERR_GENERIC
+    fi
+    sleep 1
+    done
+
+    ocf_log info "Galera Load Balancer daemon (glbd) started"
+    return $OCF_SUCCESS
+}
+
+glbd_stop() {
+    local rc
+    local pid
+
+    glbd_status
+    rc=$?
+    if [ $rc -eq $OCF_NOT_RUNNING ]; then
+        ocf_log info "Galera Load Balancer daemon (glbd) already stopped"
+        return $OCF_SUCCESS
+    fi
+
+    # Try SIGTERM
+    pid=`cat $OCF_RESKEY_pid`
+    ocf_run kill -s TERM $pid
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        ocf_log err "Galera Load Balancer daemon (glbd) couldn't be stopped"
+        exit $OCF_ERR_GENERIC
+    fi
+
+    # stop waiting
+    shutdown_timeout=15
+    if [ -n "$OCF_RESKEY_CRM_meta_timeout" ]; then
+        shutdown_timeout=$((($OCF_RESKEY_CRM_meta_timeout/1000)-5))
+    fi
+    count=0
+    while [ $count -lt $shutdown_timeout ]; do
+        glbd_status
+        rc=$?
+        if [ $rc -eq $OCF_NOT_RUNNING ]; then
+            break
+        fi
+        count=`expr $count + 1`
+        sleep 1
+        ocf_log debug "Galera Load Balancer daemon (glbd) still hasn't stopped yet. Waiting ..."
+    done
+
+    glbd_status
+    rc=$?
+    if [ $rc -ne $OCF_NOT_RUNNING ]; then
+        # SIGTERM didn't help either, try SIGKILL
+        ocf_log info "Galera Load Balancer daemon (glbd) failed to stop after ${shutdown_timeout}s \
+          using SIGTERM. Trying SIGKILL ..."
+        ocf_run kill -s KILL $pid
+    fi
+
+    ocf_log info "Galera Load Balancer daemon (glbd) stopped"
+
+    rm -f $OCF_RESKEY_pid
+
+    return $OCF_SUCCESS
+}
+
+#######################################################################
+
+case "$1" in
+  meta-data)    meta_data
+                exit $OCF_SUCCESS;;
+  usage|help)   usage
+                exit $OCF_SUCCESS;;
+esac
+
+# Anything except meta-data and help must pass validation
+glbd_validate || exit $?
+
+# What kind of method was invoked?
+case "$1" in
+  start)        glbd_start;;
+  stop)         glbd_stop;;
+  status)       glbd_status;;
+  monitor)      glbd_monitor;;
+  validate-all) ;;
+  *)            usage
+                exit $OCF_ERR_UNIMPLEMENTED;;
+esac
