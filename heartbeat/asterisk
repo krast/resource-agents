@@ -459,8 +459,8 @@ case "$1" in
 esac
 
 
-# Anything except meta-data and help must pass validation
-asterisk_validate || exit $?
+# Anything except meta-data, help and stop must pass validation
+[ "$1" != "stop" ] && asterisk_validate || exit $?
 
 # Now that validate has passed and we can be sure to be able to read
 # the config file, set convenience variables
