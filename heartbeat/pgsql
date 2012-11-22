@@ -56,6 +56,7 @@ OCF_RESKEY_recovery_end_command_default=""
 OCF_RESKEY_master_ip_default=""
 OCF_RESKEY_repuser_default="postgres"
 OCF_RESKEY_primary_conninfo_opt_default=""
+OCF_RESKEY_restart_on_promote_default="false"
 OCF_RESKEY_tmpdir_default="/var/lib/pgsql/tmp"
 OCF_RESKEY_xlog_check_count_default="3"
 OCF_RESKEY_crm_attr_timeout_default="5"
@@ -85,6 +86,7 @@ OCF_RESKEY_stop_escalate_in_slave_default=30
 : ${OCF_RESKEY_master_ip=${OCF_RESKEY_master_ip_default}}
 : ${OCF_RESKEY_repuser=${OCF_RESKEY_repuser_default}}
 : ${OCF_RESKEY_primary_conninfo_opt=${OCF_RESKEY_primary_conninfo_opt_default}}
+: ${OCF_RESKEY_restart_on_promote=${OCF_RESKEY_restart_on_promote_default}}
 : ${OCF_RESKEY_tmpdir=${OCF_RESKEY_tmpdir_default}}
 : ${OCF_RESKEY_xlog_check_count=${OCF_RESKEY_xlog_check_count_default}}
 : ${OCF_RESKEY_crm_attr_timeout=${OCF_RESKEY_crm_attr_timeout_default}}
@@ -252,13 +254,11 @@ Number of shutdown retries (using -m fast) before resorting to -m immediate
 
 <parameter name="rep_mode" unique="0" required="0">
 <longdesc lang="en">
-Replication mode(none(default)/async/sync).
-"async" and "sync" require PostgreSQL 9.1 or later.
-If you use async or sync, it requires node_list, master_ip, restore_command
-parameters, and needs setting postgresql.conf, pg_hba.conf up for
-replication.
-Please delete "include /../../rep_mode.conf" line in postgresql.conf
-when you switch from sync to async.
+Replication mode may be set to "async" or "sync".
+Both require PostgreSQL 9.1 or later.
+Once set, this parameter requires node_list, master_ip, and
+restore_command parameters,as well as configuring postgresql
+for replication (in postgresql.conf and pg_hba.conf).
 </longdesc>
 <shortdesc lang="en">rep_mode</shortdesc>
 <content type="string" default="${OCF_RESKEY_rep_mode_default}" />
@@ -327,6 +327,17 @@ This is optional for replication.
 </longdesc>
 <shortdesc lang="en">primary_conninfo_opt</shortdesc>
 <content type="string" default="${OCF_RESKEY_primary_conninfo_opt_default}" />
+</parameter>
+
+<parameter name="restart_on_promote" unique="0" required="0">
+<longdesc lang="en">
+If this is true, RA deletes recovery.conf and restarts PostgreSQL
+on promote to keep Timeline ID. It probably makes fail-over slower.
+It's recommended to set on-fail of promote up as fence.
+This is optional for replication.
+</longdesc>
+<shortdesc lang="en">restart_on_promote</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_restart_on_promote_default}" />
 </parameter>
 
 <parameter name="tmpdir" unique="0" required="0">
@@ -576,28 +587,44 @@ pgsql_promote() {
     touch $PGSQL_LOCK
     show_master_baseline
 
-    runasowner "$OCF_RESKEY_pgctl -D $OCF_RESKEY_pgdata promote"
-    if [ $? -eq 0 ]; then
-        ocf_log info "PostgreSQL promote command sent."
-    else
-        ocf_log err "Can't promote PostgreSQL."
-        return $OCF_ERR_GENERIC
-    fi
-
-    while :
-    do
-        pgsql_real_monitor warn
+    if ocf_is_true ${OCF_RESKEY_restart_on_promote}; then
+        ocf_log info "Restarting PostgreSQL instead of promote."
+        #stop : this function returns $OCF_SUCCESS only.
+        pgsql_real_stop slave
+        rm -f $RECOVERY_CONF
+        pgsql_real_start
         rc=$?
-        if [ $rc -eq $OCF_RUNNING_MASTER ]; then
-            break;
-        elif [ $rc -eq $OCF_ERR_GENERIC ]; then
-            ocf_log err "Can't promote PostgreSQL."
-            return $rc
+        if [ $rc -ne $OCF_RUNNING_MASTER ]; then
+            ocf_log err "Can't start PostgreSQL as primary on promote."
+            if [ $rc -ne $OCF_SUCCESS ]; then
+                change_pgsql_status "$NODENAME" "STOP"
+            fi
+            return $OCF_ERR_GENERIC
         fi
-        sleep 1
-        ocf_log debug "PostgreSQL still hasn't promoted yet. Waiting..."
-    done
-    ocf_log info "PostgreSQL is promoted."
+    else
+        runasowner "$OCF_RESKEY_pgctl -D $OCF_RESKEY_pgdata promote"
+        if [ $? -eq 0 ]; then
+            ocf_log info "PostgreSQL promote command sent."
+        else
+            ocf_log err "Can't promote PostgreSQL."
+            return $OCF_ERR_GENERIC
+        fi
+
+        while :
+        do
+            pgsql_real_monitor warn
+            rc=$?
+            if [ $rc -eq $OCF_RUNNING_MASTER ]; then
+                break;
+            elif [ $rc -eq $OCF_ERR_GENERIC ]; then
+                ocf_log err "Can't promote PostgreSQL."
+                return $rc
+            fi
+            sleep 1
+            ocf_log debug "PostgreSQL still hasn't promoted yet. Waiting..."
+        done
+        ocf_log info "PostgreSQL is promoted."
+    fi
 
     change_data_status "$NODENAME" "LATEST"
     $CRM_MASTER -v $PROMOTE_ME
@@ -825,7 +852,7 @@ pgsql_replication_monitor() {
 
     # I can't get master node name from $OCF_RESKEY_CRM_meta_notify_master_uname on monitor,
     # so I will get master node name using crm_mon -n
-    crm_mon -n1 | tr -d "\t" | grep -q "^${RESOURCE_NAME}:.* Master"
+    crm_mon -n1 | tr -d "\t" | tr -d " " | grep -q "^${RESOURCE_NAME}:.*Master$"
     if [ $? -ne 0 ] ; then
         # If I am Slave and Master is not exist
         ocf_log info "Master does not exist."
@@ -1358,38 +1385,52 @@ change_data_status() {
     return 0
 }
 
+# set master-score
+# arg1:node, arg2: score, arg3: resoure
+set_master_score() {
+    local current_score
+
+    current_score=`$CRM_ATTR_REBOOT -N "$1" -n "master-$3" -G -q 2>/dev/null`
+    if [ -n "$current_score" -a "$current_score" != "$2" ]; then
+        ocf_log info "Changing $3 master score on $1 : $current_score->$2."
+        $CRM_ATTR_REBOOT -N "$target" -n "master-$3" -v "$2"
+        if [ $? -ne 0 ]; then
+            ocf_log err "Can't change master score."
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # change master-score
 # arg1:node, arg2: score
 change_master_score() {
     local instance
-    local current_score
 
     if ! is_node_online $1; then
         return 0
     fi
 
-    instance=0
-    while :
-    do
-        if [ "$instance" -ge "$OCF_RESKEY_CRM_meta_clone_max" ]; then
-            break
-        fi
-        if [ "${RESOURCE_NAME}:${instance}" = "$OCF_RESOURCE_INSTANCE" ]; then
-            instance=`expr $instance + 1`
-            continue
-        fi
-
-        current_score=`$CRM_ATTR_REBOOT -N "$1" -n "master-${RESOURCE_NAME}:${instance}" -G -q 2>/dev/null`
-        if [ -n "$current_score" -a "$current_score" != "$2" ]; then
-            ocf_log info "Changing ${RESOURCE_NAME}:${instance} master score on $1 : $current_score->$2."
-            $CRM_ATTR_REBOOT -N "$target" -n "master-${RESOURCE_NAME}:${instance}" -v "$2"
-            if [ $? -ne 0 ]; then
-                ocf_log err "Can't change master score."
-                return 1
+    if echo $OCF_RESOURCE_INSTANCE | grep -q ":"; then
+        # If Pacemaker version is 1.0.x
+        instance=0
+        while :
+        do
+            if [ "$instance" -ge "$OCF_RESKEY_CRM_meta_clone_max" ]; then
+                break
             fi
-        fi
-        instance=`expr $instance + 1`
-    done
+            if [ "${RESOURCE_NAME}:${instance}" = "$OCF_RESOURCE_INSTANCE" ]; then
+                instance=`expr $instance + 1`
+                continue
+            fi
+            set_master_score $1 $2 "${RESOURCE_NAME}:${instance}" || return 1
+            instance=`expr $instance + 1`
+        done
+    else
+        # If globally-unique=false and Pacemaker version is 1.1.8 or higher 
+        # Master/Slave resource has no instance number
+        set_master_score $1 $2 ${RESOURCE_NAME} || return 1
+    fi
     return 0
 }
 
@@ -1473,6 +1514,7 @@ check_config() {
 pgsql_validate_all() {
     local version
     local check_config_rc
+    local rep_mode_string
 
     if ! check_binary2 "$OCF_RESKEY_pgctl" || 
        ! check_binary2 "$OCF_RESKEY_psql"; then
@@ -1533,9 +1575,18 @@ pgsql_validate_all() {
             ocf_log err "node_list can't be empty."
             return $OCF_ERR_CONFIGURED
         fi
-        if [ "$OCF_RESKEY_rep_mode" = "sync" -a $check_config_rc -eq 0 ]; then
-            if ! grep -q "include '$REP_MODE_CONF' # added by pgsql RA" $OCF_RESKEY_config; then
-                echo "include '$REP_MODE_CONF' # added by pgsql RA" >> $OCF_RESKEY_config
+        if [ $check_config_rc -eq 0 ]; then
+            rep_mode_string="include '$REP_MODE_CONF' # added by pgsql RA"
+            if [ "$OCF_RESKEY_rep_mode" = "sync" ]; then
+                if ! grep -q "$rep_mode_string" $OCF_RESKEY_config; then
+                    ocf_log info "adding include directive into $OCF_RESKEY_config"
+                    echo "$rep_mode_string" >> $OCF_RESKEY_config
+                fi
+            else
+                if grep -q "$rep_mode_string" $OCF_RESKEY_config; then
+                    ocf_log info "deleting include directive from $OCF_RESKEY_config"
+                    sed -i "/${rep_mode_string//\//\\/}/d" $OCF_RESKEY_config
+                fi
             fi
         fi
         if ! mkdir -p $OCF_RESKEY_tmpdir || ! chown $OCF_RESKEY_pgdba $OCF_RESKEY_tmpdir || ! chmod 700 $OCF_RESKEY_tmpdir; then
@@ -1640,7 +1691,6 @@ if is_replication; then
 
     NODENAME=`uname -n | tr '[A-Z]' '[a-z]'`
     NODE_LIST=`echo $OCF_RESKEY_node_list | tr '[A-Z]' '[a-z]'`
-    OPERATION=$1
 fi
 
 case "$1" in
@@ -1659,7 +1709,10 @@ rc=$?
 if [ $rc -ne 0 ]
 then
     case "$1" in
-        stop)    exit $OCF_SUCCESS;;
+        stop)    if is_replication; then
+                    change_pgsql_status "$NODENAME" "UNKNOWN"
+                 fi
+                 exit $OCF_SUCCESS;;
         monitor) exit $OCF_NOT_RUNNING;;
         status)  exit $OCF_NOT_RUNNING;;
         *)       exit $rc;;

@@ -66,9 +66,12 @@
 
 : ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
 . ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+. ${OCF_FUNCTIONS_DIR}/findif.sh
 
 # Defaults
 OCF_RESKEY_lvs_support_default=false
+OCF_RESKEY_lvs_ipv6_addrlabel_default=false
+OCF_RESKEY_lvs_ipv6_addrlabel_value_default=99
 OCF_RESKEY_clusterip_hash_default="sourceip-sourceport"
 OCF_RESKEY_unique_clone_address_default=false
 OCF_RESKEY_arp_interval_default=200
@@ -77,6 +80,8 @@ OCF_RESKEY_arp_bg_default=true
 OCF_RESKEY_arp_mac_default="ffffffffffff"
 
 : ${OCF_RESKEY_lvs_support=${OCF_RESKEY_lvs_support_default}}
+: ${OCF_RESKEY_lvs_ipv6_addrlabel=${OCF_RESKEY_lvs_ipv6_addrlabel_default}}
+: ${OCF_RESKEY_lvs_ipv6_addrlabel_value=${OCF_RESKEY_lvs_ipv6_addrlabel_value_default}}
 : ${OCF_RESKEY_clusterip_hash=${OCF_RESKEY_clusterip_hash_default}}
 : ${OCF_RESKEY_unique_clone_address=${OCF_RESKEY_unique_clone_address_default}}
 : ${OCF_RESKEY_arp_interval=${OCF_RESKEY_arp_interval_default}}
@@ -86,7 +91,8 @@ OCF_RESKEY_arp_mac_default="ffffffffffff"
 #######################################################################
 
 SENDARP=$HA_BIN/send_arp
-FINDIF=$HA_BIN/findif
+SENDUA=$HA_BIN/send_ua
+FINDIF=findif
 VLDIR=$HA_RSCTMP
 SENDARPPIDDIR=$HA_RSCTMP
 CIP_lockfile=$HA_RSCTMP/IPaddr2-CIP-${OCF_RESKEY_ip}
@@ -185,9 +191,41 @@ Enable support for LVS Direct Routing configurations. In case a IP
 address is stopped, only move it to the loopback device to allow the
 local node to continue to service requests, but no longer advertise it
 on the network.
+
+Notes for IPv6:
+It is not necessary to enable this option on IPv6.
+Instead, enable 'lvs_ipv6_addrlabel' option for LVS-DR usage on IPv6.
 </longdesc>
 <shortdesc lang="en">Enable support for LVS DR</shortdesc>
 <content type="boolean" default="${OCF_RESKEY_lvs_support_default}"/>
+</parameter>
+
+<parameter name="lvs_ipv6_addrlabel">
+<longdesc lang="en">
+Enable adding IPv6 address label so IPv6 traffic originating from
+the address' interface does not use this address as the source.
+This is necessary for LVS-DR health checks to realservers to work. Without it,
+the most recently added IPv6 address (probably the address added by IPaddr2)
+will be used as the source address for IPv6 traffic from that interface and
+since that address exists on loopback on the realservers, the realserver
+response to pings/connections will not never leave its loopback.
+See RFC3484 for the detail of the source address selection.
+
+See also 'lvs_ipv6_addrlabel_value' parameter.
+</longdesc>
+<shortdesc lang="en">Enables adding IPv6 address label.</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_lvs_ipv6_addrlabel_default}"/>
+</parameter>
+
+<parameter name="lvs_ipv6_addrlabel_value">
+<longdesc lang="en">
+Specify IPv6 address label value used when 'lvs_ipv6_addrlabel' is enabled.
+The value should be an unused label in the policy table
+which is shown by 'ip addrlabel list' command.
+You would rarely need to change this parameter.
+</longdesc>
+<shortdesc lang="en">IPv6 address label value.</shortdesc>
+<content type="integer" default="${OCF_RESKEY_lvs_ipv6_addrlabel_value_default}"/>
 </parameter>
 
 <parameter name="mac">
@@ -251,6 +289,16 @@ You really shouldn't be touching this.
 </longdesc>
 <shortdesc lang="en">ARP MAC</shortdesc>
 <content type="string" default="${OCF_RESKEY_arp_mac_default}"/>
+</parameter>
+
+<parameter name="arp_sender">
+<longdesc lang="en">
+The program to send ARP packets with on start. For infiniband
+interfaces, default is ipoibarping. If ipoibarping is not
+available, set this to send_arp.
+</longdesc>
+<shortdesc lang="en">ARP sender</shortdesc>
+<content type="string" default=""/>
 </parameter>
 
 <parameter name="flush_routes">
@@ -342,27 +390,50 @@ ip_init() {
 		exit $OCF_ERR_CONFIGURED
 	fi
 
+	echo $OCF_RESKEY_ip | grep -qs ":"
+	if [ $? -ne 0 ];then
+		FAMILY=inet
+		if ocf_is_true $OCF_RESKEY_lvs_ipv6_addrlabel ;then
+			ocf_log err "IPv4 does not support lvs_ipv6_addrlabel"
+			exit $OCF_ERR_CONFIGURED
+		fi
+	else
+		FAMILY=inet6
+		if ocf_is_true $OCF_RESKEY_lvs_support ;then
+			ocf_log err "The IPv6 does not support lvs_support"
+			exit $OCF_ERR_CONFIGURED
+		fi
+		if ocf_is_true $OCF_RESKEY_lvs_ipv6_addrlabel ;then
+			if ocf_is_decimal "$OCF_RESKEY_lvs_ipv6_addrlabel_value" && [ $OCF_RESKEY_lvs_ipv6_addrlabel_value -ge 0 ]; then
+			    :
+			else
+			    ocf_log err "Invalid lvs_ipv6_addrlabel_value [$OCF_RESKEY_lvs_ipv6_addrlabel_value], should be positive integer"
+			    exit $OCF_ERR_CONFIGURED
+			fi
+		fi
+	fi
+
 	# $FINDIF takes its parameters from the environment
 	#
-	NICINFO=`$FINDIF -C`
+	NICINFO=`$FINDIF`
 	rc=$?
 	if
 	  [ $rc -eq 0 ]
         then
-	    NICINFO=`echo $NICINFO | sed -e 's/netmask\ //;s/broadcast\ //'`
+	    NICINFO=`echo "$NICINFO" | sed -e 's/netmask\ //;s/broadcast\ //'`
 	    NIC=`echo "$NICINFO" | cut -d" " -f1`
 	    NETMASK=`echo "$NICINFO" | cut -d" " -f2`
 	    BRDCAST=`echo "$NICINFO" | cut -d" " -f3`
 	else
 		# findif couldn't find the interface
 		if ocf_is_probe; then
-			ocf_log info "[$FINDIF -C] failed"
+			ocf_log info "[$FINDIF] failed"
 			exit $OCF_NOT_RUNNING
 		elif [ "$__OCF_ACTION" = stop ]; then
-			ocf_log warn "[$FINDIF -C] failed"
+			ocf_log warn "[$FINDIF] failed"
 			exit $OCF_SUCCESS
 		else
-			ocf_log err "[$FINDIF -C] failed"
+			ocf_log err "[$FINDIF] failed"
 			exit $rc
 		fi
 	fi
@@ -415,7 +486,7 @@ find_interface() {
 	#
 	# List interfaces but exclude FreeS/WAN ipsecN virtual interfaces
 	#
-	local iface="`$IP2UTIL -o -f inet addr show \
+	local iface="`$IP2UTIL -o -f $FAMILY addr show \
 		| grep "\ $ipaddr/$netmask" \
 		| cut -d ' ' -f2 \
 		| grep -v '^ipsec[0-9][0-9]*$'`"
@@ -432,12 +503,16 @@ delete_interface () {
 	iface="$2"
 	netmask="$3"
 
-	CMD="$IP2UTIL -f inet addr delete $ipaddr/$netmask dev $iface"
+	CMD="$IP2UTIL -f $FAMILY addr delete $ipaddr/$netmask dev $iface"
 
 	ocf_run $CMD || return $OCF_ERR_GENERIC
 
 	if ocf_is_true $OCF_RESKEY_flush_routes; then
 	    ocf_run $IP2UTIL route flush cache
+	fi
+
+	if [ "$FAMILY" = "inet6" ] && ocf_is_true $OCF_RESKEY_lvs_ipv6_addrlabel ;then
+	    delete_ipv6_addrlabel $ipaddr
 	fi
 
 	return $OCF_SUCCESS
@@ -455,8 +530,16 @@ add_interface () {
 	iface="$4"
 	label="$5"
 
-	cmd="$IP2UTIL -f inet addr add $ipaddr/$netmask brd $broadcast dev $iface"
-	msg="Adding IPv4 address $ipaddr/$netmask with broadcast address $broadcast to device $iface"
+	if [ "$FAMILY" = "inet6" ] && ocf_is_true $OCF_RESKEY_lvs_ipv6_addrlabel ;then
+	    add_ipv6_addrlabel $ipaddr
+	fi
+
+	cmd="$IP2UTIL -f $FAMILY addr add $ipaddr/$netmask dev $iface"
+	msg="Adding $FAMILY address $ipaddr/$netmask to device $iface"
+	if [ "$broadcast" != "none" ]; then
+		cmd="$IP2UTIL -f $FAMILY addr add $ipaddr/$netmask brd $broadcast dev $iface"
+		msg="Adding $FAMILY address $ipaddr/$netmask with broadcast address $broadcast to device $iface"
+	fi
 
 	if [ ! -z "$label" ]; then
 		cmd="$cmd label $label"
@@ -536,6 +619,25 @@ restore_loopback() {
 	fi
 }
 
+add_ipv6_addrlabel() {
+	local cmd ipaddr value
+	ipaddr="$1"
+	value="$OCF_RESKEY_lvs_ipv6_addrlabel_value"
+
+	cmd="$IP2UTIL addrlabel add prefix $ipaddr label $value"
+	ocf_log info "Adding IPv6 address label prefix $ipaddr label $value"
+	ocf_run $cmd || ocf_log warn "$cmd failed."
+}
+
+delete_ipv6_addrlabel() {
+	local cmd ipaddr value
+	ipaddr="$1"
+	value="$OCF_RESKEY_lvs_ipv6_addrlabel_value"
+
+	cmd="$IP2UTIL addrlabel del prefix $ipaddr label $value"
+	ocf_run $cmd # an error can be ignored
+}
+
 is_infiniband() {
 	$IP2UTIL link show $NIC | grep link/infiniband >/dev/null
 }
@@ -555,10 +657,33 @@ run_send_arp() {
 	fi
 	ocf_log info "$SENDARP $ARGS"
 	if ocf_is_true $OCF_RESKEY_arp_bg; then
-		($SENDARP $ARGS || ocf_log err "Could not send gratuitous arps" &) >&2
+		($SENDARP $ARGS || ocf_log err "Could not send gratuitous arps")& >&2
 	else
 		$SENDARP $ARGS || ocf_log err "Could not send gratuitous arps"
 	fi
+}
+
+#
+# Run send_ua to note send ICMPv6 Unsolicited Neighbor Advertisements.
+#
+run_send_ua() {
+	local i
+	# Wait until the allocated IPv6 address gets ready by checking
+	# "tentative" flag is disappeared, otherwise send_ua can not
+	# send the unsolicited advertisement requests.
+	for i in 1 2 3 4 5; do
+		$IP2UTIL -o -f $FAMILY addr show dev $NIC \
+			| grep -q -e "$OCF_RESKEY_ip/$NETMASK .* tentative"
+		[ $? -ne 0 ] && break
+		if [ $i -eq 5 ]; then
+			ocf_log warn "$OCF_RESKEY_ip still has 'tentative' status. (ignored)"
+			break
+		fi
+		sleep 1
+	done
+	ARGS="-i $OCF_RESKEY_arp_interval -c $OCF_RESKEY_arp_count $OCF_RESKEY_ip $NETMASK $NIC"
+	ocf_log info "$SENDUA $ARGS"
+	$SENDUA $ARGS || ocf_log err "Could not send ICMPv6 Unsolicited Neighbor Advertisements."
 }
 
 #
@@ -568,7 +693,7 @@ run_send_ib_arp() {
 	ARGS="-q -c $OCF_RESKEY_arp_count -U -I $NIC $OCF_RESKEY_ip"
 	ocf_log info "ipoibarping $ARGS"
 	if ocf_is_true $OCF_RESKEY_arp_bg; then
-		(ipoibarping $ARGS || ocf_log err "Could not send gratuitous arps" &) >&2
+		(ipoibarping $ARGS || ocf_log err "Could not send gratuitous arps")& >&2
 	else
 		ipoibarping $ARGS || ocf_log err "Could not send gratuitous arps"
 	fi
@@ -680,7 +805,7 @@ ip_start() {
 	
 	if [ "$ip_status" = "no" ]; then
 		if ocf_is_true ${OCF_RESKEY_lvs_support}; then
-			for i in `find_interface $OCF_RESKEY_ip $NETMASK`; do
+			for i in `find_interface $OCF_RESKEY_ip 32`; do
 				case $i in
 				lo*)
 					remove_conflicting_loopback $OCF_RESKEY_ip 32 255.255.255.255 lo
@@ -689,7 +814,7 @@ ip_start() {
 			done
 		fi
 		
-		add_interface $OCF_RESKEY_ip $NETMASK $BRDCAST $NIC $IFLABEL
+		add_interface $OCF_RESKEY_ip $NETMASK ${BRDCAST:-none} $NIC $IFLABEL
 		
 		if [ $? -ne 0 ]; then
 			ocf_log err "$CMD failed."
@@ -702,11 +827,13 @@ ip_start() {
 		: no need to run send_arp on loopback
 		;;
 	*)
-	    if is_infiniband; then
-		run_send_ib_arp
-	    elif [ -x $SENDARP ]; then
-		run_send_arp
-	    fi
+		if [ $FAMILY = "inet" ];then
+		    $ARP_SEND_FUN
+		else
+		    if [ -x $SENDUA ]; then
+			run_send_ua
+		    fi
+		fi
 		;;
 	esac
 	exit $OCF_SUCCESS
@@ -795,13 +922,43 @@ ip_monitor() {
 	esac
 }
 
+# make sure that we have something to send ARPs with
+set_send_arp_program() {
+    if [ -n "$OCF_RESKEY_arp_sender" ]; then
+	case "$OCF_RESKEY_arp_sender" in
+	send_arp)
+	    check_binary $SENDARP
+	    ARP_SEND_FUN=run_send_arp
+	;;
+	ipoibarping)
+	    check_binary ipoibarping
+	    ARP_SEND_FUN=run_send_ib_arp
+	;;
+	*)
+	    ocf_log err "unrecognized arp_sender value: $OCF_RESKEY_arp_sender"
+	    exit $OCF_ERR_CONFIGURED
+	;;
+	esac
+    else
+	if is_infiniband; then
+	    ARP_SEND_FUN=run_send_ib_arp
+	    if ! have_binary ipoibarping; then
+	    	[ "$__OCF_ACTION" = start ] &&
+		    ocf_log warn "using send_arp for infiniband because ipoibarping is not available (set arp_sender to \"send_arp\" to suppress this message)"
+		check_binary $SENDARP
+		ARP_SEND_FUN=run_send_arp
+	    fi
+	fi
+    fi
+}
+
 ip_validate() {
     check_binary $IP2UTIL
     IP_CIP=
 
     ip_init
 
-    is_infiniband && check_binary ipoibarping
+    set_send_arp_program
 
     if [ -n "$IP_CIP" ]; then
 	check_binary $IPTABLES
@@ -903,3 +1060,4 @@ validate-all)	;;
 		exit $OCF_ERR_UNIMPLEMENTED
 		;;
 esac
+# vi:sw=4:ts=8:
